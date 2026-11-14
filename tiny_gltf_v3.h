@@ -1145,6 +1145,82 @@ TINYGLTF3_API int32_t tg3_num_components(int32_t type);
 TINYGLTF3_API int32_t tg3_accessor_byte_stride(const tg3_accessor *accessor,
                                                 const tg3_buffer_view *buffer_view);
 
+/* ----------------------------------------------------------------------
+ * Merged accessor / vertex-attribute reading
+ *
+ * glTF sparse accessors only store the elements that deviate from the base
+ * bufferView. The functions below materialize the complete accessor so that
+ * callers never have to walk `sparse` themselves:
+ *
+ *   - element i of the result is element i of the accessor (the same vertex a
+ *     primitive's index accessor refers to),
+ *   - if the accessor has a base bufferView, element i starts as its base value
+ *     read at `byteOffset + i * byteStride` (interleaved base data is
+ *     de-strided, tightly packed data uses the natural element size),
+ *   - every sparse entry then replaces exactly the element named by its sparse
+ *     index; entries not named by the sparse set keep their base value,
+ *   - when the accessor has no base bufferView (base data absent), elements
+ *     not covered by the sparse set are zero.
+ *
+ * All reads are bounds checked against both the bufferView declarations and
+ * the actually loaded buffer bytes. Truncated data, invalid component types,
+ * and duplicate / out-of-range sparse indices are reported as errors; no
+ * partially merged result is ever handed back.
+ * ---------------------------------------------------------------------- */
+
+/* Read an accessor as tightly packed raw elements, one element after another.
+ * `out` receives `accessor->count * element_size` bytes where
+ * element_size = tg3_component_size(componentType) * tg3_num_components(type).
+ * Byte order and integer/normalized encoding are preserved exactly, so the
+ * caller can apply the accessor's componentType/normalized flags itself.
+ * `*out_byte_count` and `*out_element_size` (both optional) receive the
+ * required size on success. Passing out == NULL performs a size query and
+ * still validates the accessor. Returns TG3_OK, TG3_ERR_INVALID_INDEX for a
+ * bad `accessor_index`, TG3_ERR_INVALID_VALUE for a NULL `model` or an `out`
+ * buffer smaller than the accessor, and TG3_ERR_INVALID_ACCESSOR for an
+ * unsupported component type, an out-of-range byte span, truncated buffer
+ * data, or duplicate/out-of-range sparse indices. */
+TINYGLTF3_API tg3_error_code tg3_accessor_read(
+    const tg3_model *model, int32_t accessor_index,
+    uint8_t *out, uint64_t out_capacity,
+    uint64_t *out_byte_count, uint64_t *out_element_size,
+    tg3_error_stack *errors);
+
+/* Read an accessor as decoded double values: `accessor->count *
+ * tg3_num_components(accessor->type)` doubles. Integer components are
+ * normalized per the glTF `accessor.normalized` rule (signed: max(v/max,-1),
+ * unsigned: v/max); floating point components are widened unchanged. The
+ * accessor-to-vertex correspondence, sparse merge and error behavior match
+ * tg3_accessor_read(). `*out_value_count` and `*out_components` (optional)
+ * receive the number of doubles and the per-element component count.
+ * Passing out == NULL performs a size query. */
+TINYGLTF3_API tg3_error_code tg3_accessor_read_values(
+    const tg3_model *model, int32_t accessor_index,
+    double *out_values, uint64_t out_capacity,
+    uint64_t *out_value_count, uint32_t *out_components,
+    tg3_error_stack *errors);
+
+/* Convenience wrapper: decode the named attribute ("POSITION", "NORMAL", ...)
+ * of one mesh primitive with the semantics of tg3_accessor_read_values().
+ * `attribute_name_len` may be 0 to use strlen(attribute_name). Returns
+ * TG3_ERR_INVALID_VALUE when the primitive has no such attribute. */
+TINYGLTF3_API tg3_error_code tg3_read_vertex_attribute(
+    const tg3_model *model, const tg3_mesh *mesh, uint32_t primitive_index,
+    const char *attribute_name, uint32_t attribute_name_len,
+    double *out_values, uint64_t out_capacity,
+    uint64_t *out_value_count, uint32_t *out_components,
+    tg3_error_stack *errors);
+
+/* Read a primitive's triangle/geometry index accessor as uint32 values, in
+ * the accessor's original order, so each returned index still refers to the
+ * matching vertex read from the same primitive (sparse index accessors are
+ * merged first). The primitive must define `indices`, and that accessor must
+ * be a SCALAR accessor with an unsigned component type. */
+TINYGLTF3_API tg3_error_code tg3_read_primitive_indices(
+    const tg3_model *model, const tg3_mesh *mesh, uint32_t primitive_index,
+    uint32_t *out_indices, uint64_t out_capacity,
+    uint64_t *out_index_count, tg3_error_stack *errors);
+
 /* Check if a string is a data URI */
 TINYGLTF3_API int32_t tg3_is_data_uri(const char *uri, uint32_t len);
 

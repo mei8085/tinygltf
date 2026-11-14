@@ -14,6 +14,7 @@ https://github.com/KhronosGroup/glTF loader and writer, with experimental
 - **Opt-in filesystem and image I/O** — `TINYGLTF3_ENABLE_FS` / `TINYGLTF3_ENABLE_STB_IMAGE` are off by default; you control when and how assets are loaded.
 - **C++20 coroutine facade** (optional, auto-detected). C17/C++17 default.
 - **Hardened against untrusted input** — URI sanitization, post-parse index-bounds and byte-range validation (default-on, opt-out via `tg3_parse_options.validate_indices` / `validate_ranges`), strict numeric range checks; exercised by a libFuzzer harness. See the `Security Considerations` block at the top of `tiny_gltf_v3.h`.
+- **Merged accessor reads** — `tg3_accessor_read()` / `tg3_accessor_read_values()` / `tg3_read_vertex_attribute()` / `tg3_read_primitive_indices()` materialize sparse accessors on top of their base data, so callers get complete vertex attributes and index lists without walking `sparse` themselves.
 - **Strictness levels** — spec-conformance violations are warnings by default (`TG3_PERMISSIVE`) and errors under `TG3_STRICT`; `tg3_validate()` checks hand-built models with the same rules.
 - **Formal specification and machine-checked proofs** — a Lean 4 specification of the validation rules and GLB framing, and a Lean proof that the C GLB framing code is free of undefined behaviour and refines the specification. See [`formal/`](formal/README.md).
 
@@ -58,6 +59,42 @@ tg3_model_free(&model);
 tg3_error_stack_free(&errors);
 ```
 
+Reading a mesh primitive's vertices and indices (sparse accessors are merged
+over their base data first; elements without base data read as zero):
+
+```c
+const tg3_mesh *mesh = &model.meshes[0];
+const tg3_primitive *prim = &mesh->primitives[0];
+
+uint64_t value_count = 0;
+uint32_t components = 0;
+tg3_error_code err = tg3_read_vertex_attribute(
+    &model, mesh, 0, "POSITION", 0, NULL, 0, &value_count, &components, &errors);
+if (err == TG3_OK) {
+    double *positions = malloc(value_count * sizeof(double));   /* 3 per vertex */
+    err = tg3_read_vertex_attribute(&model, mesh, 0, "POSITION", 0,
+                                    positions, value_count, NULL, NULL, &errors);
+    /* positions[3 * v + c] is component c of vertex v */
+    free(positions);
+}
+
+uint64_t index_count = 0;
+if (prim->indices >= 0) {
+    uint32_t *indices = NULL;
+    err = tg3_read_primitive_indices(&model, mesh, 0, NULL, 0, &index_count, &errors);
+    indices = malloc(index_count * sizeof(uint32_t));
+    err = tg3_read_primitive_indices(&model, mesh, 0, indices, index_count,
+                                     NULL, &errors);
+    /* indices[k] still names the same vertex after the sparse merge */
+}
+```
+
+`tg3_accessor_read()` returns the same merge as tightly packed raw bytes (with
+the accessor's component type and normalized encoding preserved), and
+`tg3_accessor_read_values()` decodes it to doubles using the glTF
+normalization rules. All four readers validate on entry, so calling them on a
+hand-built model cannot produce out-of-range or mis-aligned geometry.
+
 ## Strictness and validation
 
 Validation rules come in two classes (the normative list is
@@ -65,7 +102,7 @@ Validation rules come in two classes (the normative list is
 
 | Class | Examples | `TG3_PERMISSIVE` (default) | `TG3_STRICT` |
 |---|---|---|---|
-| Memory safety | out-of-range indices, accessor/bufferView byte ranges, unknown component types | error | error |
+| Memory safety | out-of-range indices, accessor/bufferView byte ranges, unknown component types, duplicate or out-of-range sparse indices | error | error |
 | Spec conformance | `alphaMode`, primitive `mode`, sampler filters, camera parameters, factor ranges, `byteStride` alignment, `extensionsRequired ⊆ extensionsUsed` | warning | error (`TG3_ERR_INVALID_VALUE`) |
 
 ```c

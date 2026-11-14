@@ -153,6 +153,69 @@ static int tg3w_attr_index(const tg3_primitive *p, const char *name) {
     return -1;
 }
 
+/* Fetches one float VECn attribute of a primitive, merging sparse overrides
+ * over the base bufferView (or zeros when there is no base). Writes
+ * vcount * components floats to `dst`. Works for both interleaved/plain
+ * accessors and sparse accessors, and rejects attributes whose component
+ * type is not float or whose count does not match the vertex count. */
+static int tg3w_fill_attribute(const tg3_primitive *p, const char *name,
+                               uint64_t vcount, uint32_t components,
+                               float *dst) {
+    int idx = tg3w_attr_index(p, name);
+    if (idx < 0 || (uint32_t)idx >= g_model.accessors_count) return 0;
+    const tg3_accessor *a = &g_model.accessors[idx];
+    if (a->component_type != TG3_COMPONENT_TYPE_FLOAT ||
+        a->type != (components == 2 ? TG3_TYPE_VEC2 : TG3_TYPE_VEC3) ||
+        a->count != vcount) {
+        return 0;
+    }
+    if (!dst) return 0;
+    if (a->sparse.is_sparse) {
+        /* Materialize the merged attribute as doubles, then narrow to float. */
+        uint64_t values = 0;
+        uint32_t comps = 0;
+        if (tg3_accessor_read_values(&g_model, idx, NULL, 0, &values, &comps,
+                                     &g_errors) != TG3_OK) {
+            return 0;
+        }
+        if (values != vcount * components || comps != components) return 0;
+        double *tmp = (double *)malloc((size_t)(values ? values : 1) * sizeof(double));
+        if (!tmp) return 0;
+        if (tg3_accessor_read_values(&g_model, idx, tmp, values, NULL, NULL,
+                                     &g_errors) != TG3_OK) {
+            free(tmp);
+            return 0;
+        }
+        for (uint64_t i = 0; i < values; i++) dst[i] = (float)tmp[i];
+        free(tmp);
+        return 1;
+    }
+    uint64_t stride = 0;
+    const uint8_t *base = tg3w_accessor_ptr(&g_model, a, &stride);
+    if (!base) return 0;
+    for (uint64_t v = 0; v < vcount; v++) {
+        const float *f = (const float *)(base + v * stride);
+        for (uint32_t c = 0; c < components; c++) dst[v * components + c] = f[c];
+    }
+    return 1;
+}
+
+/* Fetches a primitive's indices as uint32, merging a sparse index accessor
+ * first so returned indices still address the same vertices. Returns the
+ * index count, or 0 when the primitive has no usable index accessor or the
+ * destination is too small. */
+static uint64_t tg3w_fill_indices(const tg3_mesh *mesh, uint32_t prim_index,
+                                  uint32_t *dst, uint64_t dst_capacity) {
+    const tg3_primitive *p = &mesh->primitives[prim_index];
+    uint64_t count = 0;
+    if (p->indices < 0 || (uint32_t)p->indices >= g_model.accessors_count) return 0;
+    if (tg3_read_primitive_indices(&g_model, mesh, prim_index, dst,
+                                   dst_capacity, &count, &g_errors) != TG3_OK) {
+        return 0;
+    }
+    return count;
+}
+
 /* ------------------------------------------------------------------ */
 /* Parse + flatten                                                     */
 /* ------------------------------------------------------------------ */
@@ -183,42 +246,42 @@ TG3W_EXPORT int tg3w_parse(const uint8_t *data, uint32_t size) {
             int nrm_i = tg3w_attr_index(p, "NORMAL");
             int uv_i  = tg3w_attr_index(p, "TEXCOORD_0");
             uint64_t vcount = 0;
-            if (pos_i >= 0) {
+            if (pos_i >= 0 && (uint32_t)pos_i < g_model.accessors_count) {
                 const tg3_accessor *a = &g_model.accessors[pos_i];
+                /* Sparse positions are merged by tg3_accessor_read_values; the
+                 * vertex count comes from the accessor either way. */
                 if (a->component_type == TG3_COMPONENT_TYPE_FLOAT &&
-                    a->type == TG3_TYPE_VEC3 && !a->sparse.is_sparse) {
+                    a->type == TG3_TYPE_VEC3) {
                     vcount = a->count;
                 }
             }
             uint64_t icount = 0;
-            if (p->indices >= 0) {
+            if (p->indices >= 0 && (uint32_t)p->indices < g_model.accessors_count) {
                 const tg3_accessor *a = &g_model.accessors[p->indices];
-                if (!a->sparse.is_sparse) {
-                    switch (a->component_type) {
-                    case TG3_COMPONENT_TYPE_UNSIGNED_BYTE:
-                    case TG3_COMPONENT_TYPE_UNSIGNED_SHORT:
-                    case TG3_COMPONENT_TYPE_UNSIGNED_INT:
-                        icount = a->count;
-                        break;
-                    default: break;
-                    }
+                switch (a->component_type) {
+                case TG3_COMPONENT_TYPE_UNSIGNED_BYTE:
+                case TG3_COMPONENT_TYPE_UNSIGNED_SHORT:
+                case TG3_COMPONENT_TYPE_UNSIGNED_INT:
+                    if (a->type == TG3_TYPE_SCALAR) icount = a->count;
+                    break;
+                default: break;
                 }
             }
             if (vcount == 0) {
-                continue; /* unsupported primitive (e.g. sparse/double) */
+                continue; /* unsupported primitive (e.g. double positions) */
             }
             total_pos += vcount * 3;
             if (nrm_i >= 0) {
                 const tg3_accessor *a = &g_model.accessors[nrm_i];
                 if (a->component_type == TG3_COMPONENT_TYPE_FLOAT &&
-                    a->type == TG3_TYPE_VEC3 && !a->sparse.is_sparse) {
+                    a->type == TG3_TYPE_VEC3 && a->count == vcount) {
                     total_nrm += vcount * 3;
                 }
             }
             if (uv_i >= 0) {
                 const tg3_accessor *a = &g_model.accessors[uv_i];
                 if (a->component_type == TG3_COMPONENT_TYPE_FLOAT &&
-                    a->type == TG3_TYPE_VEC2 && !a->sparse.is_sparse) {
+                    a->type == TG3_TYPE_VEC2 && a->count == vcount) {
                     total_uv += vcount * 2;
                 }
             }
@@ -233,14 +296,16 @@ TG3W_EXPORT int tg3w_parse(const uint8_t *data, uint32_t size) {
         return -1;
     }
 
-    /* Allocate flattened arrays. */
+    /* Allocate flattened arrays. Each is allocated with at least one element
+     * so the fill helpers can safely form `base + offset` even when a stage
+     * count is zero (pointer arithmetic on NULL would be undefined). */
     free(g_prims); free(g_positions); free(g_normals); free(g_uvs); free(g_indices);
     free(g_mesh_prim_start); free(g_mesh_prim_count);
     g_prims  = (tg3w_prim *)malloc(prims * sizeof(tg3w_prim));
-    g_positions = (float *)malloc(total_pos * sizeof(float));
+    g_positions = (float *)malloc((total_pos ? total_pos : 1) * sizeof(float));
     g_normals   = total_nrm ? (float *)malloc(total_nrm * sizeof(float)) : NULL;
     g_uvs       = total_uv ? (float *)malloc(total_uv * sizeof(float)) : NULL;
-    g_indices   = (uint32_t *)malloc(total_idx * sizeof(uint32_t));
+    g_indices   = (uint32_t *)malloc((total_idx ? total_idx : 1) * sizeof(uint32_t));
     g_mesh_prim_start = (uint32_t *)malloc(g_model.meshes_count * sizeof(uint32_t));
     g_mesh_prim_count = (uint32_t *)malloc(g_model.meshes_count * sizeof(uint32_t));
     g_prim_count = 0;
@@ -264,18 +329,17 @@ TG3W_EXPORT int tg3w_parse(const uint8_t *data, uint32_t size) {
             const tg3_primitive *p = &mesh->primitives[pi];
             int pos_i = tg3w_attr_index(p, "POSITION");
             uint64_t vcount = 0;
-            uint64_t pstride = 0;
-            const uint8_t *pp = NULL;
             if (pos_i >= 0) {
                 const tg3_accessor *a = &g_model.accessors[pos_i];
                 if (a->component_type == TG3_COMPONENT_TYPE_FLOAT &&
-                    a->type == TG3_TYPE_VEC3 && !a->sparse.is_sparse) {
+                    a->type == TG3_TYPE_VEC3) {
                     vcount = a->count;
-                    pp = tg3w_accessor_ptr(&g_model, a, &pstride);
                 }
             }
-            if (!pp || vcount == 0) {
-                continue;
+            if (vcount == 0 ||
+                !tg3w_fill_attribute(p, "POSITION", vcount, 3,
+                                     g_positions + p_off)) {
+                continue; /* unsupported positions */
             }
 
             tg3w_prim *out = &g_prims[g_prim_count];
@@ -286,74 +350,30 @@ TG3W_EXPORT int tg3w_parse(const uint8_t *data, uint32_t size) {
             out->mode = (p->mode == -1) ? TG3_MODE_TRIANGLES : p->mode;
             out->vertex_count = (uint32_t)vcount;
             out->pos_offset = p_off;
-
-            for (uint64_t v = 0; v < vcount; v++) {
-                const float *f = (const float *)(pp + v * pstride);
-                g_positions[p_off + (uint32_t)v * 3 + 0] = f[0];
-                g_positions[p_off + (uint32_t)v * 3 + 1] = f[1];
-                g_positions[p_off + (uint32_t)v * 3 + 2] = f[2];
-            }
             p_off += (uint32_t)vcount * 3;
 
-            int nrm_i = tg3w_attr_index(p, "NORMAL");
-            if (nrm_i >= 0) {
-                const tg3_accessor *a = &g_model.accessors[nrm_i];
-                uint64_t stride = 0;
-                const uint8_t *np = tg3w_accessor_ptr(&g_model, a, &stride);
-                if (np && a->component_type == TG3_COMPONENT_TYPE_FLOAT &&
-                    a->type == TG3_TYPE_VEC3 && a->count == vcount) {
-                    out->nrm_offset = (int32_t)n_off;
-                    for (uint64_t v = 0; v < vcount; v++) {
-                        const float *f = (const float *)(np + v * stride);
-                        g_normals[n_off + (uint32_t)v * 3 + 0] = f[0];
-                        g_normals[n_off + (uint32_t)v * 3 + 1] = f[1];
-                        g_normals[n_off + (uint32_t)v * 3 + 2] = f[2];
-                    }
-                    n_off += (uint32_t)vcount * 3;
-                }
+            if (tg3w_fill_attribute(p, "NORMAL", vcount, 3,
+                                    g_normals ? g_normals + n_off : NULL)) {
+                out->nrm_offset = (int32_t)n_off;
+                n_off += (uint32_t)vcount * 3;
             }
 
-            int uv_i = tg3w_attr_index(p, "TEXCOORD_0");
-            if (uv_i >= 0) {
-                const tg3_accessor *a = &g_model.accessors[uv_i];
-                uint64_t stride = 0;
-                const uint8_t *up = tg3w_accessor_ptr(&g_model, a, &stride);
-                if (up && a->component_type == TG3_COMPONENT_TYPE_FLOAT &&
-                    a->type == TG3_TYPE_VEC2 && a->count == vcount) {
-                    out->uv_offset = (int32_t)u_off;
-                    for (uint64_t v = 0; v < vcount; v++) {
-                        const float *f = (const float *)(up + v * stride);
-                        g_uvs[u_off + (uint32_t)v * 2 + 0] = f[0];
-                        g_uvs[u_off + (uint32_t)v * 2 + 1] = f[1];
-                    }
-                    u_off += (uint32_t)vcount * 2;
-                }
+            if (tg3w_fill_attribute(p, "TEXCOORD_0", vcount, 2,
+                                    g_uvs ? g_uvs + u_off : NULL)) {
+                out->uv_offset = (int32_t)u_off;
+                u_off += (uint32_t)vcount * 2;
             }
 
-            if (p->indices >= 0) {
-                const tg3_accessor *a = &g_model.accessors[p->indices];
-                uint64_t stride = 0;
-                const uint8_t *ip = tg3w_accessor_ptr(&g_model, a, &stride);
-                if (ip && !a->sparse.is_sparse) {
-                    out->index_count = (uint32_t)a->count;
+            {
+                uint64_t capacity = (i_off < total_idx)
+                                        ? total_idx - i_off
+                                        : 0;
+                uint64_t icount = tg3w_fill_indices(mesh, pi, g_indices + i_off,
+                                                    capacity);
+                if (icount) {
+                    out->index_count = (uint32_t)icount;
                     out->idx_offset = i_off;
-                    for (uint64_t v = 0; v < a->count; v++) {
-                        uint32_t idx = 0;
-                        switch (a->component_type) {
-                        case TG3_COMPONENT_TYPE_UNSIGNED_BYTE:
-                            idx = ((const uint8_t *)ip)[v * stride];
-                            break;
-                        case TG3_COMPONENT_TYPE_UNSIGNED_SHORT:
-                            idx = ((const uint16_t *)ip)[v * stride / 2];
-                            break;
-                        case TG3_COMPONENT_TYPE_UNSIGNED_INT:
-                            idx = ((const uint32_t *)ip)[v * stride / 4];
-                            break;
-                        default: break;
-                        }
-                        g_indices[i_off + (uint32_t)v] = idx;
-                    }
-                    i_off += (uint32_t)a->count;
+                    i_off += (uint32_t)icount;
                 }
             }
             g_prim_count++;

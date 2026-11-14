@@ -1259,6 +1259,594 @@ static int check_sparse_accessor_range_rejected(void) {
   return 1;
 }
 
+/* ===== Sparse accessor merge reading ======================================= */
+
+/* Fixture bytes, all embedded as data URIs:
+ *  A (64B): 3 interleaved VEC3 floats at stride 16, then sparse u16 index 1,
+ *           then sparse values (10,11,12).
+ *  B (12B): no base accessor; u8 sparse indices [0,2], then floats 1.5, 2.5.
+ *  C (11B): normalized u8 VEC3 base (0,255,128)(64,0,255), u8 sparse index 1,
+ *           sparse values (255,255,255).
+ *  D (12B): u16 SCALAR index accessor [0,1,2,3], u8 sparse index 2 overriding
+ *           element 2 with 7.
+ *  E (12B): duplicate sparse indices [1,1] and two float values.
+ *  F (8B): out-of-range sparse index [2] for a count-2 accessor.
+ *  H (12B): plain (non-sparse) VEC3 float (1,2,3).
+ */
+#define TG3_TEST_B64_A \
+  "AACAPwAAAEAAAEBAAAAAAAAAgEAAAKBAAADAQAAAAAAAAOBAAAAAQQAAEEEAAAAAAQAAAAAAIEEAADBBAABAQQ=="
+#define TG3_TEST_B64_B "AAIAAAAAwD8AACBA"
+#define TG3_TEST_B64_C "AP+AQAD/AQD///8="
+#define TG3_TEST_B64_D "AAABAAIAAwACAAcA"
+#define TG3_TEST_B64_E "AQEAAAAAoEAAAMBA"
+#define TG3_TEST_B64_F "AgAAAAAAEEE="
+#define TG3_TEST_B64_H "AACAPwAAAEAAAEBA"
+
+static int nearly_equal(double a, double b) {
+  double d = a - b;
+  if (d < 0.0) d = -d;
+  return d <= 1e-6;
+}
+
+/* Sparse overrides are merged onto the base: element i keeps its base value
+ * (read at byteOffset + i * byteStride) unless a sparse index names it. */
+static int check_sparse_merge_over_interleaved_base(void) {
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," TG3_TEST_B64_A "\",\"byteLength\":64}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":64,\"byteStride\":16}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\","
+      "\"sparse\":{\"count\":1,\"indices\":{\"bufferView\":0,\"byteOffset\":48,\"componentType\":5123},"
+      "\"values\":{\"bufferView\":0,\"byteOffset\":52}}}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},\"indices\":0}]}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+  double v[9];
+  uint64_t n = 0;
+  uint32_t comps = 0;
+  uint8_t raw[36];
+  uint64_t raw_bytes = 0, raw_elem = 0;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_OK) {
+    fprintf(stderr, "sparse merge: parse failed %d\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  err = tg3_accessor_read_values(&model, 0, v, 9, &n, &comps, &errors);
+  if (err != TG3_OK || n != 9 || comps != 3 ||
+      !nearly_equal(v[0], 1.0) || !nearly_equal(v[1], 2.0) || !nearly_equal(v[2], 3.0) ||
+      !nearly_equal(v[3], 10.0) || !nearly_equal(v[4], 11.0) || !nearly_equal(v[5], 12.0) ||
+      !nearly_equal(v[6], 7.0) || !nearly_equal(v[7], 8.0) || !nearly_equal(v[8], 9.0)) {
+    fprintf(stderr, "sparse merge: wrong merged values (%d)\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  /* The raw reader gives the same merge, tightly packed. */
+  err = tg3_accessor_read(&model, 0, raw, sizeof(raw), &raw_bytes, &raw_elem, &errors);
+  if (err != TG3_OK || raw_bytes != 36 || raw_elem != 12) {
+    fprintf(stderr, "sparse merge: raw read size mismatch (%d)\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  /* Named-attribute helper resolves the same accessor. */
+  err = tg3_read_vertex_attribute(&model, &model.meshes[0], 0, "POSITION", 0,
+                                  v, 9, &n, &comps, &errors);
+  if (err != TG3_OK || n != 9 || comps != 3 || !nearly_equal(v[3], 10.0)) {
+    fprintf(stderr, "sparse merge: attribute helper failed (%d)\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+/* Without base data, elements not covered by the sparse set are zero. */
+static int check_sparse_without_base_is_zero(void) {
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," TG3_TEST_B64_B "\",\"byteLength\":12}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":12}],"
+      "\"accessors\":[{\"componentType\":5126,\"count\":4,\"type\":\"SCALAR\","
+      "\"sparse\":{\"count\":2,\"indices\":{\"bufferView\":0,\"componentType\":5121},"
+      "\"values\":{\"bufferView\":0,\"byteOffset\":4}}}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+  double v[4];
+  uint64_t n = 0;
+  uint32_t comps = 0;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_OK) {
+    fprintf(stderr, "sparse no base: parse failed %d\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  err = tg3_accessor_read_values(&model, 0, v, 4, &n, &comps, &errors);
+  if (err != TG3_OK || n != 4 ||
+      !nearly_equal(v[0], 1.5) || !nearly_equal(v[1], 0.0) ||
+      !nearly_equal(v[2], 2.5) || !nearly_equal(v[3], 0.0)) {
+    fprintf(stderr, "sparse no base: expected [1.5,0,2.5,0] (%d)\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+/* Integer components are normalized per glTF rules for both base and sparse
+ * values. */
+static int check_sparse_normalized_components(void) {
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," TG3_TEST_B64_C "\",\"byteLength\":11}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":11}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5121,\"count\":2,\"type\":\"VEC3\",\"normalized\":true,"
+      "\"sparse\":{\"count\":1,\"indices\":{\"bufferView\":0,\"byteOffset\":6,\"componentType\":5121},"
+      "\"values\":{\"bufferView\":0,\"byteOffset\":8}}}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+  double v[6];
+  double unit = 128.0 / 255.0;
+  uint64_t n = 0;
+  uint32_t comps = 0;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_OK) {
+    fprintf(stderr, "sparse normalized: parse failed %d\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  err = tg3_accessor_read_values(&model, 0, v, 6, &n, &comps, &errors);
+  if (err != TG3_OK || n != 6 || comps != 3 ||
+      !nearly_equal(v[0], 0.0) || !nearly_equal(v[1], 1.0) || !nearly_equal(v[2], unit) ||
+      !nearly_equal(v[3], 1.0) || !nearly_equal(v[4], 1.0) || !nearly_equal(v[5], 1.0)) {
+    fprintf(stderr, "sparse normalized: wrong normalized merge (%d)\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  /* The normalized flag survives a write -> re-read with identical values. */
+  {
+    tg3_write_options wo;
+    uint8_t *out = NULL;
+    uint64_t out_size = 0;
+    tg3_write_options_init(&wo);
+    wo.embed_buffers = 1;
+    err = tg3_write_to_memory(&model, &errors, &out, &out_size, &wo);
+    if (err != TG3_OK || !out || out_size == 0) {
+      fprintf(stderr, "sparse normalized: write failed %d\n", (int)err);
+      tg3_write_free(out, &wo);
+      tg3_model_free(&model); tg3_error_stack_free(&errors);
+      return 0;
+    }
+    tg3_write_free(out, &wo);
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+/* A sparse index accessor is merged first; returned indices still refer to
+ * the same vertices. */
+static int check_sparse_primitive_indices(void) {
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," TG3_TEST_B64_D "\",\"byteLength\":12}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":12}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5123,\"count\":4,\"type\":\"SCALAR\","
+      "\"sparse\":{\"count\":1,\"indices\":{\"bufferView\":0,\"byteOffset\":8,\"componentType\":5121},"
+      "\"values\":{\"bufferView\":0,\"byteOffset\":10}}}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{},\"indices\":0}]}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+  uint32_t idx[4];
+  uint64_t n = 0;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_OK) {
+    fprintf(stderr, "sparse indices: parse failed %d\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  err = tg3_read_primitive_indices(&model, &model.meshes[0], 0, idx, 4, &n, &errors);
+  if (err != TG3_OK || n != 4 || idx[0] != 0 || idx[1] != 1 || idx[2] != 7 || idx[3] != 3) {
+    fprintf(stderr, "sparse indices: expected [0,1,7,3] (%d)\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+/* Duplicate or out-of-range sparse indices must fail the load, never yield
+ * mis-indexed geometry. */
+static int check_sparse_index_content_rejected(void) {
+  static const char *const cases[] = {
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," TG3_TEST_B64_E "\",\"byteLength\":12}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":12}],"
+      "\"accessors\":[{\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\","
+      "\"sparse\":{\"count\":2,\"indices\":{\"bufferView\":0,\"componentType\":5121},"
+      "\"values\":{\"bufferView\":0,\"byteOffset\":4}}}]}",
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," TG3_TEST_B64_F "\",\"byteLength\":8}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":8}],"
+      "\"accessors\":[{\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\","
+      "\"sparse\":{\"count\":1,\"indices\":{\"bufferView\":0,\"componentType\":5121},"
+      "\"values\":{\"bufferView\":0,\"byteOffset\":4}}}]}"};
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  uint32_t c;
+
+  for (c = 0; c < (uint32_t)(sizeof(cases) / sizeof(cases[0])); ++c) {
+    tg3_error_code err;
+    tg3_error_stack_init(&errors);
+    tg3_parse_options_init(&opts);
+    err = tg3_parse(&model, &errors, (const uint8_t *)cases[c], strlen(cases[c]), "", 0, &opts);
+    if (err != TG3_ERR_INVALID_ACCESSOR) {
+      fprintf(stderr, "sparse index content case %u: expected TG3_ERR_INVALID_ACCESSOR, got %d\n",
+              (unsigned)c, (int)err);
+      tg3_model_free(&model); tg3_error_stack_free(&errors);
+      return 0;
+    }
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+  }
+  return 1;
+}
+
+/* Truncated sparse values (bufferView bytes exceed the loaded buffer) fail. */
+static int check_sparse_truncated_rejected(void) {
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," TG3_TEST_B64_B "\",\"byteLength\":12}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":6}],"
+      "\"accessors\":[{\"componentType\":5126,\"count\":4,\"type\":\"SCALAR\","
+      "\"sparse\":{\"count\":2,\"indices\":{\"bufferView\":0,\"componentType\":5121},"
+      "\"values\":{\"bufferView\":0,\"byteOffset\":4}}}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_ERR_INVALID_ACCESSOR) {
+    fprintf(stderr, "sparse truncated: expected TG3_ERR_INVALID_ACCESSOR, got %d\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+/* The reader re-validates a hand-built model: duplicates and truncation are
+ * rejected even when parse-time validation never ran. */
+static int check_sparse_reader_validation(void) {
+  uint8_t buffer_data[] = {
+      0,0,128,63, 0,0,0,64, 0,0,64,64, 0,0,0,0,
+      0,0,128,64, 0,0,160,64, 0,0,192,64, 0,0,0,0,
+      0,0,224,64, 0,0,0,65, 0,0,16,65, 0,0,0,0,
+      0,2,0,0,
+      0,0,32,65, 0,0,48,65, 0,0,64,65,
+      0,0,160,65, 0,0,168,65, 0,0,176,65};
+  tg3_buffer buf;
+  tg3_buffer_view bvs[3];
+  tg3_accessor acc;
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_error_code err;
+  double v[9];
+  uint64_t n = 0;
+  uint32_t comps = 0;
+
+  memset(&buf, 0, sizeof(buf));
+  memset(bvs, 0, sizeof(bvs));
+  memset(&acc, 0, sizeof(acc));
+  memset(&model, 0, sizeof(model));
+  tg3_error_stack_init(&errors);
+
+  buf.data.data = buffer_data;
+  buf.data.count = sizeof(buffer_data);
+  buf.byte_length = sizeof(buffer_data);
+  bvs[0].buffer = 0; bvs[0].byte_offset = 0; bvs[0].byte_length = 48; bvs[0].byte_stride = 16;
+  bvs[1].buffer = 0; bvs[1].byte_offset = 48; bvs[1].byte_length = 2;
+  bvs[2].buffer = 0; bvs[2].byte_offset = 52; bvs[2].byte_length = 24;
+  acc.buffer_view = 0; acc.component_type = TG3_COMPONENT_TYPE_FLOAT;
+  acc.count = 3; acc.type = TG3_TYPE_VEC3;
+  acc.sparse.is_sparse = 1; acc.sparse.count = 2;
+  acc.sparse.indices.buffer_view = 1;
+  acc.sparse.indices.component_type = TG3_COMPONENT_TYPE_UNSIGNED_BYTE;
+  acc.sparse.values.buffer_view = 2;
+  model.buffers = &buf; model.buffers_count = 1;
+  model.buffer_views = bvs; model.buffer_views_count = 3;
+  model.accessors = &acc; model.accessors_count = 1;
+
+  err = tg3_accessor_read_values(&model, 0, v, 9, &n, &comps, &errors);
+  if (err != TG3_OK || n != 9 ||
+      !nearly_equal(v[0], 10.0) || !nearly_equal(v[3], 4.0) || !nearly_equal(v[6], 20.0)) {
+    fprintf(stderr, "sparse reader: hand-built merge failed (%d)\n", (int)err);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  buffer_data[49] = 0; /* indices -> [0,0]: duplicate */
+  err = tg3_accessor_read_values(&model, 0, v, 9, &n, &comps, &errors);
+  if (err != TG3_ERR_INVALID_ACCESSOR) {
+    fprintf(stderr, "sparse reader: duplicate index not rejected (%d)\n", (int)err);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  buffer_data[49] = 2;
+  buf.data.count = 60; /* values truncated */
+  err = tg3_accessor_read_values(&model, 0, v, 9, &n, &comps, &errors);
+  if (err != TG3_ERR_INVALID_ACCESSOR) {
+    fprintf(stderr, "sparse reader: truncation not rejected (%d)\n", (int)err);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+/* Plain accessors and write -> re-read keep their original results, and the
+ * sparse accessor survives the round trip with the same merged values. */
+static int check_sparse_write_reread(void) {
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," TG3_TEST_B64_A "\",\"byteLength\":64}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":64,\"byteStride\":16}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\","
+      "\"sparse\":{\"count\":1,\"indices\":{\"bufferView\":0,\"byteOffset\":48,\"componentType\":5123},"
+      "\"values\":{\"bufferView\":0,\"byteOffset\":52}}}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0}}]}]}";
+  static const uint8_t plain_json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," TG3_TEST_B64_H "\",\"byteLength\":12}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":12}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":1,\"type\":\"VEC3\"}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_write_options wo;
+  tg3_error_code err;
+  double before[9];
+  uint64_t n = 0;
+  uint32_t comps = 0;
+  uint8_t *out = NULL;
+  uint64_t out_size = 0;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_OK) {
+    fprintf(stderr, "sparse write: parse failed %d\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  err = tg3_accessor_read_values(&model, 0, before, 9, &n, &comps, &errors);
+  if (err != TG3_OK) {
+    fprintf(stderr, "sparse write: read failed %d\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_write_options_init(&wo);
+  wo.embed_buffers = 1;
+  err = tg3_write_to_memory(&model, &errors, &out, &out_size, &wo);
+  if (err != TG3_OK || !out || out_size == 0) {
+    fprintf(stderr, "sparse write: write failed %d\n", (int)err);
+    tg3_write_free(out, &wo);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  {
+    tg3_model reread;
+    tg3_error_stack reread_errors;
+    tg3_parse_options reread_opts;
+    double after[9];
+    uint64_t rn = 0;
+    uint32_t rcomps = 0;
+    tg3_error_stack_init(&reread_errors);
+    tg3_parse_options_init(&reread_opts);
+    err = tg3_parse(&reread, &reread_errors, out, out_size, "", 0, &reread_opts);
+    if (err != TG3_OK) {
+      fprintf(stderr, "sparse write: re-read parse failed %d\n", (int)err);
+      tg3_model_free(&reread); tg3_error_stack_free(&reread_errors);
+      tg3_write_free(out, &wo);
+      tg3_model_free(&model); tg3_error_stack_free(&errors);
+      return 0;
+    }
+    if (reread.accessors_count != 1 || reread.accessors[0].sparse.is_sparse != 1) {
+      fprintf(stderr, "sparse write: sparse description lost in roundtrip\n");
+      tg3_model_free(&reread); tg3_error_stack_free(&reread_errors);
+      tg3_write_free(out, &wo);
+      tg3_model_free(&model); tg3_error_stack_free(&errors);
+      return 0;
+    }
+    err = tg3_accessor_read_values(&reread, 0, after, 9, &rn, &rcomps, &reread_errors);
+    if (err != TG3_OK || rn != 9 || rcomps != 3 || memcmp(before, after, sizeof(before)) != 0) {
+      fprintf(stderr, "sparse write: merged values changed after roundtrip (%d)\n", (int)err);
+      tg3_model_free(&reread); tg3_error_stack_free(&reread_errors);
+      tg3_write_free(out, &wo);
+      tg3_model_free(&model); tg3_error_stack_free(&errors);
+      return 0;
+    }
+    tg3_model_free(&reread); tg3_error_stack_free(&reread_errors);
+  }
+  tg3_write_free(out, &wo);
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+
+  /* Plain accessor: read value is unchanged before/after a round trip. */
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, plain_json, (uint64_t)(sizeof(plain_json) - 1), "", 0, &opts);
+  if (err != TG3_OK) {
+    fprintf(stderr, "plain write: parse failed %d\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  {
+    double p[3];
+    uint64_t pn = 0;
+    uint32_t pc = 0;
+    err = tg3_accessor_read_values(&model, 0, p, 3, &pn, &pc, &errors);
+    if (err != TG3_OK || pn != 3 || !nearly_equal(p[0], 1.0) ||
+        !nearly_equal(p[1], 2.0) || !nearly_equal(p[2], 3.0)) {
+      fprintf(stderr, "plain write: unexpected values (%d)\n", (int)err);
+      tg3_model_free(&model); tg3_error_stack_free(&errors);
+      return 0;
+    }
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+/* Argument handling: size query, bad accessor index, and a too-small buffer. */
+static int check_sparse_read_arguments(void) {
+  static const uint8_t json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," TG3_TEST_B64_H "\",\"byteLength\":12}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":12}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":1,\"type\":\"VEC3\"}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+  uint64_t bytes = 0, elem = 0;
+  uint8_t small[4];
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, json, (uint64_t)(sizeof(json) - 1), "", 0, &opts);
+  if (err != TG3_OK) {
+    fprintf(stderr, "read args: parse failed %d\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  err = tg3_accessor_read(&model, 0, NULL, 0, &bytes, &elem, &errors);
+  if (err != TG3_OK || bytes != 12 || elem != 12) {
+    fprintf(stderr, "read args: size query mismatch (%d)\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  err = tg3_accessor_read(&model, 5, NULL, 0, &bytes, &elem, &errors);
+  if (err != TG3_ERR_INVALID_INDEX) {
+    fprintf(stderr, "read args: bad index not rejected (%d)\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  err = tg3_accessor_read(&model, 0, small, sizeof(small), NULL, NULL, &errors);
+  if (err != TG3_ERR_INVALID_VALUE) {
+    fprintf(stderr, "read args: small output accepted (%d)\n", (int)err);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+/* The bundled sparse morph-target model has one morph target whose POSITION
+ * accessor has no base bufferView and 12 sparse overrides. Reading it must
+ * yield zeros everywhere except those 12 vertices. */
+static int parse_path_for_test(tg3_model *model, tg3_error_stack *errors,
+                               const char *path, const tg3_parse_options *opts);
+
+static int check_sparse_morph_target_model(void) {
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  const tg3_primitive *prim;
+  uint64_t n = 0;
+  uint32_t comps = 0;
+  double v[72];
+  uint32_t i;
+  int nonzero = 0;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  if (!parse_path_for_test(&model, &errors,
+                           "../models/SparseMorphTargets-issue280/singleBlendshapeCube_sparse.glb",
+                           &opts)) {
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  if (model.meshes_count != 1 || model.meshes[0].primitives_count != 1) {
+    fprintf(stderr, "sparse morph model: unexpected mesh layout\n");
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  prim = &model.meshes[0].primitives[0];
+  if (prim->targets_count != 1 || !prim->targets ||
+      prim->target_attribute_counts[0] < 1) {
+    fprintf(stderr, "sparse morph model: expected one morph target\n");
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  {
+    int32_t target_acc = -1;
+    uint32_t k;
+    for (k = 0; k < prim->target_attribute_counts[0]; ++k) {
+      if (prim->targets[0][k].key.len == 8 &&
+          memcmp(prim->targets[0][k].key.data, "POSITION", 8) == 0) {
+        target_acc = prim->targets[0][k].value;
+      }
+    }
+    if (target_acc < 0 || !model.accessors[target_acc].sparse.is_sparse) {
+      fprintf(stderr, "sparse morph model: morph POSITION is not sparse\n");
+      tg3_model_free(&model); tg3_error_stack_free(&errors);
+      return 0;
+    }
+    if (tg3_accessor_read_values(&model, target_acc, NULL, 0, &n, &comps, &errors) != TG3_OK ||
+        comps != 3) {
+      fprintf(stderr, "sparse morph model: size query failed\n");
+      tg3_model_free(&model); tg3_error_stack_free(&errors);
+      return 0;
+    }
+    if (n != 72 || tg3_accessor_read_values(&model, target_acc, v, n, NULL, NULL,
+                                            &errors) != TG3_OK) {
+      fprintf(stderr, "sparse morph model: read failed\n");
+      tg3_model_free(&model); tg3_error_stack_free(&errors);
+      return 0;
+    }
+  }
+  for (i = 0; i < 24; ++i) {
+    if (v[i * 3] != 0.0 || v[i * 3 + 1] != 0.0 || v[i * 3 + 2] != 0.0) ++nonzero;
+  }
+  if (nonzero != 12) {
+    fprintf(stderr, "sparse morph model: expected 12 non-zero vertices, got %d\n", nonzero);
+    tg3_model_free(&model); tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
 static int check_skip_extras_values_opt_in(void) {
   static const uint8_t json[] =
       "{\"asset\":{\"version\":\"2.0\"},"
@@ -2074,6 +2662,36 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (!check_sparse_accessor_range_rejected()) {
+    return 1;
+  }
+  if (!check_sparse_merge_over_interleaved_base()) {
+    return 1;
+  }
+  if (!check_sparse_without_base_is_zero()) {
+    return 1;
+  }
+  if (!check_sparse_normalized_components()) {
+    return 1;
+  }
+  if (!check_sparse_primitive_indices()) {
+    return 1;
+  }
+  if (!check_sparse_index_content_rejected()) {
+    return 1;
+  }
+  if (!check_sparse_truncated_rejected()) {
+    return 1;
+  }
+  if (!check_sparse_reader_validation()) {
+    return 1;
+  }
+  if (!check_sparse_write_reread()) {
+    return 1;
+  }
+  if (!check_sparse_read_arguments()) {
+    return 1;
+  }
+  if (!check_sparse_morph_target_model()) {
     return 1;
   }
   if (!check_skip_extras_values_opt_in()) {

@@ -689,6 +689,690 @@ static int tg3__u64_fits_size(uint64_t v) {
 #endif
 }
 
+/* ---- Accessor reading helpers ---------------------------------------------
+ * Shared by tg3_accessor_read(), tg3_accessor_read_values(),
+ * tg3_read_vertex_attribute() and tg3_read_primitive_indices(), plus the
+ * load-time sparse-index validation in tg3__validate_resources(). All helpers
+ * use only fixed-width unsigned arithmetic and bounds-check every access
+ * against both the bufferView declaration and the loaded buffer bytes. */
+
+static void tg3__reader_error(tg3_error_stack *errors, tg3_error_code code,
+                              const char *message) {
+    tg3__error_push(errors, TG3_SEVERITY_ERROR, code, message, "/accessors", -1);
+}
+
+/* Byte offset of `byte_length` bytes inside a bufferView whose declared and
+ * loaded data both cover the range. Returns 1 on success, 0 on a bounds
+ * violation (or a null model / invalid bufferView index). */
+static int tg3__view_span(const tg3_model *m, int32_t bv_index,
+                          uint64_t byte_offset, uint64_t byte_length,
+                          const uint8_t **out_base) {
+    const tg3_buffer_view *bv;
+    const tg3_buffer *b;
+    uint64_t view_end;
+    uint64_t data_end;
+    if (!m || bv_index < 0 || (uint32_t)bv_index >= m->buffer_views_count) return 0;
+    bv = &m->buffer_views[bv_index];
+    if (tg3__u64_add_overflow(byte_offset, byte_length, &view_end) ||
+        view_end > bv->byte_length) {
+        return 0;
+    }
+    if (bv->buffer < 0 || (uint32_t)bv->buffer >= m->buffers_count) return 0;
+    b = &m->buffers[bv->buffer];
+    if (!b->data.data) return 0;
+    if (tg3__u64_add_overflow(bv->byte_offset, view_end, &data_end) ||
+        data_end > b->data.count) {
+        return 0;
+    }
+    if (out_base) *out_base = b->data.data + bv->byte_offset + byte_offset;
+    return 1;
+}
+
+static uint16_t tg3__load_u16(const uint8_t *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t tg3__load_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t tg3__load_u64(const uint8_t *p) {
+    return (uint64_t)tg3__load_u32(p) |
+           ((uint64_t)tg3__load_u32(p + 4) << 32);
+}
+
+/* Reads one unsigned sparse index. Returns 0 for a non-sparse index type. */
+static int tg3__read_sparse_index(const uint8_t *p, int32_t component_type,
+                                  uint32_t *out) {
+    switch (component_type) {
+        case TG3_COMPONENT_TYPE_UNSIGNED_BYTE:
+            *out = (uint32_t)p[0];
+            return 1;
+        case TG3_COMPONENT_TYPE_UNSIGNED_SHORT:
+            *out = (uint32_t)tg3__load_u16(p);
+            return 1;
+        case TG3_COMPONENT_TYPE_UNSIGNED_INT:
+            *out = tg3__load_u32(p);
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int tg3__valid_sparse_index_component_type(int32_t component_type) {
+    return component_type == TG3_COMPONENT_TYPE_UNSIGNED_BYTE ||
+           component_type == TG3_COMPONENT_TYPE_UNSIGNED_SHORT ||
+           component_type == TG3_COMPONENT_TYPE_UNSIGNED_INT;
+}
+
+static double tg3__normalize_component(int64_t value, int64_t max_value,
+                                       int32_t normalized) {
+    double d;
+    if (!normalized) return (double)value;
+    /* glTF 2.0: normalized = max(c / c_max, -1.0), where c_max is the
+     * component type's positive maximum (signed and unsigned alike). */
+    d = (double)value / (double)max_value;
+    return d < -1.0 ? -1.0 : d;
+}
+
+/* Decode one component into a double, applying normalization. Returns 0 for
+ * an unsupported component type. */
+static int tg3__decode_component(const uint8_t *p, int32_t component_type,
+                                 int32_t normalized, double *out) {
+    switch (component_type) {
+        case TG3_COMPONENT_TYPE_BYTE: {
+            int8_t v = (int8_t)p[0];
+            *out = tg3__normalize_component(v, 127, normalized);
+            return 1;
+        }
+        case TG3_COMPONENT_TYPE_UNSIGNED_BYTE: {
+            uint8_t v = p[0];
+            *out = tg3__normalize_component((int64_t)v, 255, normalized);
+            return 1;
+        }
+        case TG3_COMPONENT_TYPE_SHORT: {
+            int16_t v = (int16_t)tg3__load_u16(p);
+            *out = tg3__normalize_component(v, 32767, normalized);
+            return 1;
+        }
+        case TG3_COMPONENT_TYPE_UNSIGNED_SHORT: {
+            uint16_t v = tg3__load_u16(p);
+            *out = tg3__normalize_component((int64_t)v, 65535, normalized);
+            return 1;
+        }
+        case TG3_COMPONENT_TYPE_INT: {
+            int32_t v = (int32_t)tg3__load_u32(p);
+            *out = tg3__normalize_component(v, INT32_MAX, normalized);
+            return 1;
+        }
+        case TG3_COMPONENT_TYPE_UNSIGNED_INT: {
+            uint32_t v = tg3__load_u32(p);
+            *out = tg3__normalize_component((int64_t)v, 4294967295LL, normalized);
+            return 1;
+        }
+        case TG3_COMPONENT_TYPE_FLOAT: {
+            uint32_t bits = tg3__load_u32(p);
+            float f;
+            TINYGLTF3_MEMCPY(&f, &bits, sizeof(f));
+            *out = (double)f;
+            return 1;
+        }
+        case TG3_COMPONENT_TYPE_DOUBLE: {
+            uint64_t bits = tg3__load_u64(p);
+            double d;
+            TINYGLTF3_MEMCPY(&d, &bits, sizeof(d));
+            *out = d;
+            return 1;
+        }
+        default:
+            return 0;
+    }
+}
+
+/* Validates the accessor's declared layout and computes the natural element
+ * size. Returns 1 on success, 0 when the accessor has an unsupported
+ * componentType/type or a size that overflows. */
+static int tg3__accessor_layout(const tg3_accessor *a, int32_t *out_comp_size,
+                                uint32_t *out_components,
+                                uint64_t *out_element_size) {
+    int32_t comp_size;
+    int32_t components;
+    uint64_t elem;
+    if (!a) return 0;
+    comp_size = tg3_component_size(a->component_type);
+    components = tg3_num_components(a->type);
+    if (comp_size <= 0 || components <= 0) return 0;
+    if (tg3__u64_mul_overflow((uint64_t)comp_size, (uint64_t)components, &elem)) {
+        return 0;
+    }
+    if (out_comp_size) *out_comp_size = comp_size;
+    if (out_components) *out_components = (uint32_t)components;
+    if (out_element_size) *out_element_size = elem;
+    return 1;
+}
+
+/* Verifies and locates the sparse indices / values spans, then checks that
+ * every index is in [0, accessor.count) and strictly increasing (glTF
+ * requires unique, increasing sparse indices). This runs both at load time
+ * (tg3__validate_resources) and again before every read, so a hand-built
+ * model can never cause mis-indexed geometry. Rules are mirrored by
+ * formal/GlTF/Validate.lean's sparseOk. */
+static int tg3__check_sparse_set(const tg3_model *m, const tg3_accessor *a,
+                                 uint64_t element_size,
+                                 const uint8_t **indices_out,
+                                 const uint8_t **values_out,
+                                 uint64_t *index_size_out,
+                                 int32_t *index_component_out,
+                                 uint32_t *count_out) {
+    const tg3_accessor_sparse *sp = &a->sparse;
+    int32_t index_size;
+    uint64_t count;
+    uint64_t index_bytes;
+    uint64_t value_bytes;
+    uint64_t i;
+    uint32_t prev = 0;
+    int have_prev = 0;
+    const uint8_t *indices = NULL;
+    const uint8_t *values = NULL;
+    if (sp->count < 0 || (uint64_t)sp->count > a->count) return 0;
+    if (!tg3__valid_sparse_index_component_type(sp->indices.component_type)) return 0;
+    index_size = tg3_component_size(sp->indices.component_type);
+    if (index_size <= 0) return 0;
+    count = (uint64_t)sp->count;
+    if (tg3__u64_mul_overflow(count, (uint64_t)index_size, &index_bytes) ||
+        tg3__u64_mul_overflow(count, element_size, &value_bytes)) {
+        return 0;
+    }
+    if (!tg3__view_span(m, sp->indices.buffer_view, sp->indices.byte_offset,
+                        index_bytes, &indices)) {
+        return 0;
+    }
+    if (!tg3__view_span(m, sp->values.buffer_view, sp->values.byte_offset,
+                        value_bytes, &values)) {
+        return 0;
+    }
+    for (i = 0; i < count; ++i) {
+        uint32_t idx = 0;
+        if (!tg3__read_sparse_index(indices + i * (uint64_t)index_size,
+                                    sp->indices.component_type, &idx)) {
+            return 0;
+        }
+        if ((uint64_t)idx >= a->count) return 0; /* out-of-range index */
+        if (have_prev && idx <= prev) return 0;   /* duplicate or unsorted */
+        prev = idx;
+        have_prev = 1;
+    }
+    if (indices_out) *indices_out = indices;
+    if (values_out) *values_out = values;
+    if (index_size_out) *index_size_out = (uint64_t)index_size;
+    if (index_component_out) *index_component_out = sp->indices.component_type;
+    if (count_out) *count_out = (uint32_t)count;
+    return 1;
+}
+
+/* Resolves the validated base element span: NULL (no base bufferView => base
+ * data is absent and covered elements read as zero) or a pointer to the
+ * element at accessor.byteOffset. *stride_out is the base element stride. */
+static int tg3__base_span(const tg3_model *m, const tg3_accessor *a,
+                          uint64_t element_size, uint64_t *stride_out,
+                          const uint8_t **base_out) {
+    uint64_t stride;
+    uint64_t span;
+    const uint8_t *base = NULL;
+    *base_out = NULL;
+    if (a->buffer_view < 0) {
+        *stride_out = element_size;
+        return 1;
+    }
+    stride = (uint32_t)a->buffer_view < m->buffer_views_count &&
+                     m->buffer_views[a->buffer_view].byte_stride
+                 ? (uint64_t)m->buffer_views[a->buffer_view].byte_stride
+                 : element_size;
+    if (stride < element_size) return 0;
+    if (a->count > 0) {
+        if (tg3__u64_mul_overflow(a->count - 1u, stride, &span) ||
+            tg3__u64_add_overflow(span, element_size, &span)) {
+            return 0;
+        }
+    } else {
+        span = 0;
+    }
+    if (!tg3__view_span(m, a->buffer_view, a->byte_offset, span, &base)) return 0;
+    *stride_out = stride;
+    *base_out = base;
+    return 1;
+}
+
+/* Cursor over validated sparse indices, so materializing all elements is
+ * O(count + sparse_count) with no allocation. */
+typedef struct tg3__sparse_cursor {
+    const uint8_t *indices;
+    const uint8_t *values;
+    uint64_t index_size;
+    int32_t index_component;
+    uint32_t count;
+    uint32_t pos;
+} tg3__sparse_cursor;
+
+static void tg3__sparse_cursor_init(tg3__sparse_cursor *c, const uint8_t *indices,
+                                    const uint8_t *values, uint64_t index_size,
+                                    int32_t index_component, uint32_t count) {
+    c->indices = indices;
+    c->values = values;
+    c->index_size = index_size;
+    c->index_component = index_component;
+    c->count = count;
+    c->pos = 0;
+}
+
+/* For element `index`, returns the sparse value bytes that override it, or
+ * NULL when the element keeps its base value. Advances the cursor past all
+ * sparse entries <= index (indices are strictly increasing). */
+static const uint8_t *tg3__sparse_cursor_value(tg3__sparse_cursor *c,
+                                               uint64_t index,
+                                               uint64_t element_size) {
+    uint32_t sparse_index = 0;
+    int found = 0;
+    while (c->pos < c->count) {
+        if (!tg3__read_sparse_index(c->indices + (uint64_t)c->pos * c->index_size,
+                                    c->index_component, &sparse_index)) {
+            return NULL;
+        }
+        if (sparse_index > index) break;
+        found = (sparse_index == index);
+        if (found) {
+            const uint8_t *value =
+                c->values + (uint64_t)(c->pos) * element_size;
+            ++c->pos;
+            return value;
+        }
+        ++c->pos;
+    }
+    return NULL;
+}
+
+/* Decodes the merged accessor element into doubles. Returns 1 on success. */
+static int tg3__decode_element(const tg3_accessor *a, uint32_t components,
+                               int32_t comp_size, const uint8_t *element_bytes,
+                               double *out_values) {
+    uint32_t c;
+    for (c = 0; c < components; ++c) {
+        if (!tg3__decode_component(element_bytes + (uint64_t)c * (uint64_t)comp_size,
+                                   a->component_type, a->normalized,
+                                   &out_values[c])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Shared by the public readers: resolves accessor_index, validates layout and
+ * computes total element count / size with overflow checks. */
+static tg3_error_code tg3__accessor_read_prepare(const tg3_model *model,
+                                                 int32_t accessor_index,
+                                                 const tg3_accessor **out_acc,
+                                                 int32_t *out_comp_size,
+                                                 uint32_t *out_components,
+                                                 uint64_t *out_element_size,
+                                                 uint64_t *out_total_bytes,
+                                                 tg3_error_stack *errors) {
+    const tg3_accessor *a;
+    int32_t comp_size;
+    uint32_t components;
+    uint64_t element_size;
+    uint64_t total;
+    if (!model) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_VALUE, "model must not be NULL");
+        return TG3_ERR_INVALID_VALUE;
+    }
+    if (accessor_index < 0 || (uint32_t)accessor_index >= model->accessors_count) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_INDEX, "accessor index out of range");
+        return TG3_ERR_INVALID_INDEX;
+    }
+    a = &model->accessors[accessor_index];
+    if (!tg3__accessor_layout(a, &comp_size, &components, &element_size)) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_ACCESSOR,
+                          "accessor componentType/type is unsupported");
+        return TG3_ERR_INVALID_ACCESSOR;
+    }
+    if (tg3__u64_mul_overflow(a->count, element_size, &total) ||
+        !tg3__u64_fits_size(total)) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_ACCESSOR,
+                          "accessor size overflows addressable memory");
+        return TG3_ERR_INVALID_ACCESSOR;
+    }
+    if (out_acc) *out_acc = a;
+    if (out_comp_size) *out_comp_size = comp_size;
+    if (out_components) *out_components = components;
+    if (out_element_size) *out_element_size = element_size;
+    if (out_total_bytes) *out_total_bytes = total;
+    return TG3_OK;
+}
+
+/* Streams the merged accessor one element at a time through `visit`, without
+ * allocating a full copy. Each element is first written to `scratch`
+ * (element_size bytes) applying the sparse merge, then handed to the visitor. */
+typedef int (*tg3__element_visitor)(void *user_data, uint64_t index,
+                                    const uint8_t *element_bytes);
+
+static tg3_error_code tg3__accessor_visit(const tg3_model *model,
+                                          const tg3_accessor *a,
+                                          uint64_t element_size,
+                                          uint8_t *scratch,
+                                          tg3__element_visitor visit,
+                                          void *user_data,
+                                          tg3_error_stack *errors) {
+    uint64_t stride = element_size;
+    const uint8_t *base = NULL;
+    const uint8_t *sparse_indices = NULL;
+    const uint8_t *sparse_values = NULL;
+    uint64_t index_size = 0;
+    int32_t index_component = 0;
+    uint32_t sparse_count = 0;
+    tg3__sparse_cursor cursor;
+    uint64_t i;
+    if (!tg3__base_span(model, a, element_size, &stride, &base)) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_ACCESSOR,
+                          "accessor base byte range exceeds buffer data");
+        return TG3_ERR_INVALID_ACCESSOR;
+    }
+    if (a->sparse.is_sparse &&
+        !tg3__check_sparse_set(model, a, element_size, &sparse_indices,
+                               &sparse_values, &index_size, &index_component,
+                               &sparse_count)) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_ACCESSOR,
+                          "sparse indices/values are truncated, out of range, "
+                          "duplicated or unsorted");
+        return TG3_ERR_INVALID_ACCESSOR;
+    }
+    tg3__sparse_cursor_init(&cursor, sparse_indices, sparse_values, index_size,
+                            index_component, sparse_count);
+    for (i = 0; i < a->count; ++i) {
+        const uint8_t *override_bytes =
+            sparse_count ? tg3__sparse_cursor_value(&cursor, i, element_size) : NULL;
+        if (override_bytes) {
+            TINYGLTF3_MEMCPY(scratch, override_bytes, (size_t)element_size);
+        } else if (base) {
+            TINYGLTF3_MEMCPY(scratch, base + i * stride, (size_t)element_size);
+        } else {
+            TINYGLTF3_MEMSET(scratch, 0, (size_t)element_size);
+        }
+        if (!visit(user_data, i, scratch)) {
+            tg3__reader_error(errors, TG3_ERR_INVALID_ACCESSOR,
+                              "accessor element could not be decoded");
+            return TG3_ERR_INVALID_ACCESSOR;
+        }
+    }
+    return TG3_OK;
+}
+
+typedef struct tg3__raw_copy_state {
+    uint8_t *out;
+    uint64_t element_size;
+} tg3__raw_copy_state;
+
+static int tg3__raw_copy_visit(void *user_data, uint64_t index,
+                               const uint8_t *element_bytes) {
+    tg3__raw_copy_state *state = (tg3__raw_copy_state *)user_data;
+    TINYGLTF3_MEMCPY(state->out + index * state->element_size,
+                     element_bytes, (size_t)state->element_size);
+    return 1;
+}
+
+TINYGLTF3_API tg3_error_code tg3_accessor_read(
+    const tg3_model *model, int32_t accessor_index,
+    uint8_t *out, uint64_t out_capacity,
+    uint64_t *out_byte_count, uint64_t *out_element_size,
+    tg3_error_stack *errors) {
+    const tg3_accessor *a = NULL;
+    int32_t comp_size = 0;
+    uint32_t components = 0;
+    uint64_t element_size = 0;
+    uint64_t total = 0;
+    uint8_t scratch_stack[64];
+    uint8_t *scratch = scratch_stack;
+    tg3_error_code err;
+    err = tg3__accessor_read_prepare(model, accessor_index, &a, &comp_size,
+                                     &components, &element_size, &total, errors);
+    if (err != TG3_OK) return err;
+    if (out_byte_count) *out_byte_count = total;
+    if (out_element_size) *out_element_size = element_size;
+    if (!out) return TG3_OK; /* size query */
+    if (out_capacity < total) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_VALUE,
+                          "output buffer is smaller than the accessor");
+        return TG3_ERR_INVALID_VALUE;
+    }
+    if (element_size != 0 && element_size > sizeof(scratch_stack)) {
+        scratch = (uint8_t *)TINYGLTF3_MALLOC((size_t)element_size);
+        if (!scratch) {
+            tg3__reader_error(errors, TG3_ERR_OUT_OF_MEMORY,
+                              "out of memory for accessor merge buffer");
+            return TG3_ERR_OUT_OF_MEMORY;
+        }
+    }
+    {
+        tg3__raw_copy_state state;
+        state.out = out;
+        state.element_size = element_size;
+        err = tg3__accessor_visit(model, a, element_size, scratch,
+                                  tg3__raw_copy_visit, &state, errors);
+    }
+    if (scratch != scratch_stack) TINYGLTF3_FREE(scratch);
+    return err;
+}
+
+typedef struct tg3__decode_copy_state {
+    const tg3_accessor *acc;
+    uint32_t components;
+    int32_t comp_size;
+    double *out;
+} tg3__decode_copy_state;
+
+static int tg3__decode_copy_visit(void *user_data, uint64_t index,
+                                  const uint8_t *element_bytes) {
+    tg3__decode_copy_state *state = (tg3__decode_copy_state *)user_data;
+    return tg3__decode_element(state->acc, state->components, state->comp_size,
+                               element_bytes,
+                               state->out + index * state->components);
+}
+
+TINYGLTF3_API tg3_error_code tg3_accessor_read_values(
+    const tg3_model *model, int32_t accessor_index,
+    double *out_values, uint64_t out_capacity,
+    uint64_t *out_value_count, uint32_t *out_components,
+    tg3_error_stack *errors) {
+    const tg3_accessor *a = NULL;
+    int32_t comp_size = 0;
+    uint32_t components = 0;
+    uint64_t element_size = 0;
+    uint64_t total_bytes = 0;
+    uint64_t total_values = 0;
+    uint8_t scratch_stack[64];
+    uint8_t *scratch = scratch_stack;
+    tg3_error_code err;
+    err = tg3__accessor_read_prepare(model, accessor_index, &a, &comp_size,
+                                     &components, &element_size, &total_bytes,
+                                     errors);
+    if (err != TG3_OK) return err;
+    if (tg3__u64_mul_overflow(a->count, (uint64_t)components, &total_values)) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_ACCESSOR,
+                          "accessor value count overflows");
+        return TG3_ERR_INVALID_ACCESSOR;
+    }
+    if (out_value_count) *out_value_count = total_values;
+    if (out_components) *out_components = components;
+    if (!out_values) return TG3_OK; /* size query */
+    if (out_capacity < total_values) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_VALUE,
+                          "output buffer is smaller than the accessor");
+        return TG3_ERR_INVALID_VALUE;
+    }
+    if (element_size != 0 && element_size > sizeof(scratch_stack)) {
+        scratch = (uint8_t *)TINYGLTF3_MALLOC((size_t)element_size);
+        if (!scratch) {
+            tg3__reader_error(errors, TG3_ERR_OUT_OF_MEMORY,
+                              "out of memory for accessor merge buffer");
+            return TG3_ERR_OUT_OF_MEMORY;
+        }
+    }
+    {
+        tg3__decode_copy_state state;
+        state.acc = a;
+        state.components = components;
+        state.comp_size = comp_size;
+        state.out = out_values;
+        err = tg3__accessor_visit(model, a, element_size, scratch,
+                                  tg3__decode_copy_visit, &state, errors);
+    }
+    if (scratch != scratch_stack) TINYGLTF3_FREE(scratch);
+    return err;
+}
+
+TINYGLTF3_API tg3_error_code tg3_read_vertex_attribute(
+    const tg3_model *model, const tg3_mesh *mesh, uint32_t primitive_index,
+    const char *attribute_name, uint32_t attribute_name_len,
+    double *out_values, uint64_t out_capacity,
+    uint64_t *out_value_count, uint32_t *out_components,
+    tg3_error_stack *errors) {
+    const tg3_primitive *prim;
+    uint32_t name_len;
+    uint32_t i;
+    if (!model || !mesh || !attribute_name) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_VALUE,
+                          "model, mesh and attribute_name must not be NULL");
+        return TG3_ERR_INVALID_VALUE;
+    }
+    if (primitive_index >= mesh->primitives_count || !mesh->primitives) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_INDEX,
+                          "primitive index out of range");
+        return TG3_ERR_INVALID_INDEX;
+    }
+    prim = &mesh->primitives[primitive_index];
+    name_len = attribute_name_len;
+    if (name_len == 0) name_len = (uint32_t)TINYGLTF3_STRLEN(attribute_name);
+    for (i = 0; i < prim->attributes_count; ++i) {
+        const tg3_str_int_pair *attr = &prim->attributes[i];
+        if (attr->key.len == name_len &&
+            TINYGLTF3_MEMCMP(attr->key.data, attribute_name, name_len) == 0) {
+            return tg3_accessor_read_values(model, attr->value, out_values,
+                                            out_capacity, out_value_count,
+                                            out_components, errors);
+        }
+    }
+    tg3__reader_error(errors, TG3_ERR_INVALID_VALUE,
+                      "primitive has no attribute with that name");
+    return TG3_ERR_INVALID_VALUE;
+}
+
+TINYGLTF3_API tg3_error_code tg3_read_primitive_indices(
+    const tg3_model *model, const tg3_mesh *mesh, uint32_t primitive_index,
+    uint32_t *out_indices, uint64_t out_capacity,
+    uint64_t *out_index_count, tg3_error_stack *errors) {
+    const tg3_primitive *prim;
+    const tg3_accessor *a;
+    const uint8_t *base = NULL;
+    uint8_t scratch[8];
+    uint64_t stride = 0;
+    uint64_t total = 0;
+    uint64_t i;
+    int32_t comp_size;
+    uint32_t components;
+    uint64_t element_size;
+    const uint8_t *sparse_indices = NULL;
+    const uint8_t *sparse_values = NULL;
+    uint64_t index_size = 0;
+    int32_t index_component = 0;
+    uint32_t sparse_count = 0;
+    tg3__sparse_cursor cursor;
+    if (!model || !mesh) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_VALUE,
+                          "model and mesh must not be NULL");
+        return TG3_ERR_INVALID_VALUE;
+    }
+    if (primitive_index >= mesh->primitives_count || !mesh->primitives) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_INDEX,
+                          "primitive index out of range");
+        return TG3_ERR_INVALID_INDEX;
+    }
+    prim = &mesh->primitives[primitive_index];
+    if (prim->indices < 0) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_VALUE,
+                          "primitive has no index accessor");
+        return TG3_ERR_INVALID_VALUE;
+    }
+    if ((uint32_t)prim->indices >= model->accessors_count) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_INDEX,
+                          "primitive index accessor out of range");
+        return TG3_ERR_INVALID_INDEX;
+    }
+    a = &model->accessors[prim->indices];
+    if (a->type != TG3_TYPE_SCALAR ||
+        (a->component_type != TG3_COMPONENT_TYPE_UNSIGNED_BYTE &&
+         a->component_type != TG3_COMPONENT_TYPE_UNSIGNED_SHORT &&
+         a->component_type != TG3_COMPONENT_TYPE_UNSIGNED_INT)) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_ACCESSOR,
+                          "index accessor must be SCALAR with an unsigned "
+                          "integer component type");
+        return TG3_ERR_INVALID_ACCESSOR;
+    }
+    if (!tg3__accessor_layout(a, &comp_size, &components, &element_size) ||
+        element_size > sizeof(scratch) ||
+        !tg3__u64_fits_size(a->count)) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_ACCESSOR,
+                          "index accessor layout is invalid");
+        return TG3_ERR_INVALID_ACCESSOR;
+    }
+    total = a->count;
+    if (out_index_count) *out_index_count = total;
+    if (!out_indices) return TG3_OK; /* size query */
+    if (out_capacity < total) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_VALUE,
+                          "output buffer is smaller than the index accessor");
+        return TG3_ERR_INVALID_VALUE;
+    }
+    if (!tg3__base_span(model, a, element_size, &stride, &base)) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_ACCESSOR,
+                          "index accessor base byte range exceeds buffer data");
+        return TG3_ERR_INVALID_ACCESSOR;
+    }
+    if (a->sparse.is_sparse &&
+        !tg3__check_sparse_set(model, a, element_size, &sparse_indices,
+                               &sparse_values, &index_size, &index_component,
+                               &sparse_count)) {
+        tg3__reader_error(errors, TG3_ERR_INVALID_ACCESSOR,
+                          "sparse indices/values are truncated, out of range, "
+                          "duplicated or unsorted");
+        return TG3_ERR_INVALID_ACCESSOR;
+    }
+    tg3__sparse_cursor_init(&cursor, sparse_indices, sparse_values, index_size,
+                            index_component, sparse_count);
+    for (i = 0; i < total; ++i) {
+        const uint8_t *override_bytes =
+            sparse_count ? tg3__sparse_cursor_value(&cursor, i, element_size) : NULL;
+        uint32_t idx = 0;
+        const uint8_t *bytes;
+        if (override_bytes) {
+            bytes = override_bytes;
+        } else if (base) {
+            bytes = base + i * stride;
+        } else {
+            TINYGLTF3_MEMSET(scratch, 0, sizeof(scratch));
+            bytes = scratch;
+        }
+        if (a->component_type == TG3_COMPONENT_TYPE_UNSIGNED_BYTE) {
+            idx = (uint32_t)bytes[0];
+        } else if (a->component_type == TG3_COMPONENT_TYPE_UNSIGNED_SHORT) {
+            idx = (uint32_t)tg3__load_u16(bytes);
+        } else {
+            idx = tg3__load_u32(bytes);
+        }
+        out_indices[i] = idx;
+    }
+    return TG3_OK;
+}
+
 static int tg3__json_has(const tg3json_value *o, const char *key) {
     return tg3json_object_get(o, key) ? 1 : 0;
 }
@@ -2082,12 +2766,6 @@ static int tg3__valid_accessor_component_type(int32_t component_type) {
     }
 }
 
-static int tg3__valid_sparse_index_component_type(int32_t component_type) {
-    return component_type == TG3_COMPONENT_TYPE_UNSIGNED_BYTE ||
-           component_type == TG3_COMPONENT_TYPE_UNSIGNED_SHORT ||
-           component_type == TG3_COMPONENT_TYPE_UNSIGNED_INT;
-}
-
 static int tg3__validate_range_in_buffer_view(tg3__parse_ctx *ctx,
                                               const tg3_buffer_view *bv,
                                               uint64_t byte_offset,
@@ -2229,6 +2907,27 @@ static int tg3__validate_resources(tg3__parse_ctx *ctx, const tg3_model *m) {
                 if (tg3__u64_mul_overflow(sparse_count, elem_size, &bytes) ||
                     !tg3__validate_range_in_buffer_view(ctx, bv, a->sparse.values.byte_offset,
                                                         bytes, "sparse values")) {
+                    ok = 0;
+                }
+            }
+            /* Content check: every sparse index must be in range and strictly
+             * increasing, and the declared spans must be backed by the bytes
+             * actually loaded into the buffers (not just by bufferView
+             * declarations). Rejecting this at load time means a successful
+             * parse never yields geometry whose sparse merge would be
+             * mis-aligned or partially truncated. */
+            if (ok &&
+                a->sparse.indices.buffer_view >= 0 &&
+                (uint32_t)a->sparse.indices.buffer_view < m->buffer_views_count &&
+                a->sparse.values.buffer_view >= 0 &&
+                (uint32_t)a->sparse.values.buffer_view < m->buffer_views_count) {
+                if (!tg3__check_sparse_set(m, a, elem_size, NULL, NULL, NULL,
+                                           NULL, NULL)) {
+                    tg3__error_pushf(ctx->errors, ctx->arena, TG3_SEVERITY_ERROR,
+                                     TG3_ERR_INVALID_ACCESSOR, "/accessors",
+                                     "accessors[%u].sparse indices are truncated, "
+                                     "out of range [0,%llu), duplicated or unsorted",
+                                     i, (unsigned long long)a->count);
                     ok = 0;
                 }
             }

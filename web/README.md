@@ -37,8 +37,9 @@ page, or click **Load sample**.
 * Assets must be **self-contained**: GLB binary chunk or embedded data-URI
   buffers/images. External `.bin` / image file references are not resolved
   (no filesystem is linked into the module: `-sFILESYSTEM=0`).
-* Primitives must use `float` `VEC3` positions (the common case); sparse
-  accessors and `double` attributes are skipped with a warning message.
+* Primitives must use `float` `VEC3` positions (the common case); `double`
+  attributes are skipped with a warning message. Sparse position/normal/UV and
+  index accessors are merged over their base data before flattening.
 * Image decoding happens client-side: raw image bytes are passed to
   `createImageBitmap()` and wrapped in a `THREE.CanvasTexture`.
 
